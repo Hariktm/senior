@@ -1,4 +1,172 @@
-# import streamlit as st
+import streamlit as st
+import pandas as pd
+import requests
+import json
+import openpyxl
+import time
+
+st.title("Excel File Reader with Month and Year Filter")
+
+WATSONX_API_URL = "https://us-south.ml.cloud.ibm.com/ml/v1/text/generation?version=2023-05-29"
+MODEL_ID = "meta-llama/llama-3-2-90b-vision-instruct"
+PROJECT_ID = "4152f31e-6a49-40aa-9b62-0ecf629aae42"
+API_KEY = "KEmIMzkw273qBcek8IdF-aShRUvFwH7K4psARTqOvNjI"
+
+if 'processed_df' not in st.session_state:
+    st.session_state.processed_df = None
+
+# Function to get access token
+def get_access_token():
+    auth_url = "https://iam.cloud.ibm.com/identity/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    data = {"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": API_KEY}
+    for _ in range(3):
+        response = requests.post(auth_url, headers=headers, data=data)
+        if response.status_code == 200:
+            return response.json()['access_token']
+        time.sleep(1)
+    return None
+
+# Generate prompt for Watson API
+def generate_prompt(json_data, selected_months):
+    body = {
+        "input": f"""
+Given this JSON data where each entry has 'Activity Name' and 'Finish_Month_Name':
+{json.dumps(json_data, indent=2)}
+
+Perform the following task:
+1. Count the occurrences of each unique 'Activity Name' for each 'Finish_Month_Name' in the months {', '.join(selected_months)}.
+2. Return a JSON object where:
+   - Keys are unique 'Activity Name' values.
+   - Values are objects with keys as the months {', '.join(selected_months)} and values as the count of occurrences.
+   - For each 'Activity Name', include all months from {', '.join(selected_months)}, setting the count to 0 if no occurrences exist.
+3. Ensure the output is a valid JSON string with no additional text, comments, or explanations.
+
+Example input:
+[
+  {{"Activity Name": "Install Windows", "Finish_Month_Name": "Mar"}},
+  {{"Activity Name": "Install Windows", "Finish_Month_Name": "Mar"}},
+  {{"Activity Name": "Paint Walls", "Finish_Month_Name": "Apr"}}
+]
+
+Expected output:
+{{
+  "Install Windows": {{"Mar": 2, "Apr": 0}},
+  "Paint Walls": {{"Mar": 0, "Apr": 1}}
+}}
+
+Return only the valid JSON object as a string.
+""",
+        "parameters": {
+            "decoding_method": "greedy",
+            "max_new_tokens": 8100,
+            "min_new_tokens": 0,
+            "stop_sequences": [],
+            "repetition_penalty": 1.0,
+            "temperature": 0.1
+        },
+        "model_id": MODEL_ID,
+        "project_id": PROJECT_ID
+    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {get_access_token()}"}
+    if not headers["Authorization"]:
+        return None
+    
+    try:
+        response = requests.post(WATSONX_API_URL, headers=headers, json=body)
+        response.raise_for_status()
+        raw_response = response.json()['results'][0]['generated_text'].strip()
+        json.loads(raw_response)  # Validate JSON
+        return raw_response
+    except (requests.RequestException, json.JSONDecodeError, KeyError):
+        return None
+
+# Process data and display only tables
+def process_and_display_data(json_data, selected_months):
+    # Watsonx API result (or fallback to pandas if API fails)
+    result = generate_prompt(json_data, selected_months)
+    if not result:
+        df = pd.DataFrame(json_data)
+        counts = pd.pivot_table(df, index='Activity Name', columns='Finish_Month_Name', 
+                                aggfunc='size', fill_value=0).reindex(columns=selected_months, fill_value=0)
+        result = counts.to_json(orient='index')
+    
+    try:
+        activity_counts = json.loads(result)
+    except json.JSONDecodeError:
+        df = pd.DataFrame(json_data)
+        counts = pd.pivot_table(df, index='Activity Name', columns='Finish_Month_Name', 
+                                aggfunc='size', fill_value=0).reindex(columns=selected_months, fill_value=0)
+        activity_counts = json.loads(counts.to_json(orient='index'))
+
+    # Convert API result to DataFrame
+    df_data = []
+    for activity, months in activity_counts.items():
+        row = {'Activity Name': activity}
+        row.update(months)
+        row['Total Count'] = sum(months.values())
+        df_data.append(row)
+    
+    result_df = pd.DataFrame(df_data).set_index('Activity Name')
+    st.write("Activity Counts by Month (Watsonx API):")
+    st.dataframe(result_df)
+
+    # Pandas validation table
+    pandas_df = pd.DataFrame(json_data)
+    validation_counts = pd.pivot_table(pandas_df, index='Activity Name', columns='Finish_Month_Name', 
+                                       aggfunc='size', fill_value=0).reindex(columns=selected_months, fill_value=0)
+    validation_counts['Total Count'] = validation_counts.sum(axis=1)
+    st.write("Activity Counts by Month (Pandas Validation):")
+    st.dataframe(validation_counts)
+
+# File upload and processing
+uploaded_file = st.file_uploader("Choose an Excel file", type="xlsx")
+
+if uploaded_file is not None and st.session_state.processed_df is None:
+    try:
+        workbook = openpyxl.load_workbook(uploaded_file)
+        sheet_names = workbook.sheetnames
+        if len(sheet_names) > 1:
+            selected_sheet = st.selectbox("Select a sheet", sheet_names)
+        else:
+            selected_sheet = sheet_names[0]
+        
+        sheet = workbook[selected_sheet]
+        activity_col_idx = 5
+        non_bold_rows = [row_idx for row_idx, row in enumerate(sheet.iter_rows(min_row=17, max_col=16), start=16) 
+                         if row[activity_col_idx].font and not row[activity_col_idx].font.b]
+
+        df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, skiprows=15)
+        if len(df.columns) >= 16:
+            df.columns = ['Module', 'Floor', 'Flat', 'Domain', 'Activity ID', 'Activity Name', 
+                          'Monthly Look Ahead', 'Baseline Duration', 'Baseline Start', 'Baseline Finish', 
+                          'Actual Start', 'Actual Finish', '%Complete', 'Start', 'Finish', 'Delay Reasons']
+        required_columns = ['Activity Name', 'Finish']
+        df = df[required_columns]
+        df.index = df.index + 16
+        df = df.loc[df.index.isin(non_bold_rows)]
+
+        df['Finish'] = pd.to_datetime(df['Finish'], errors='coerce', dayfirst=True)
+        df['Finish_Year'] = df['Finish'].dt.year
+        df['Finish_Month_Name'] = df['Finish'].dt.strftime('%b')
+        st.session_state.processed_df = df
+    except Exception as e:
+        st.error(f"Error processing file: {str(e)}")
+
+# Process filtered data
+if st.session_state.processed_df is not None:
+    df = st.session_state.processed_df
+    available_years = sorted(df['Finish_Year'].dropna().unique())
+    available_months = sorted(df['Finish_Month_Name'].dropna().unique())
+
+    selected_year = st.sidebar.selectbox('Select Year', available_years, index=len(available_years)-1)
+    selected_months = st.sidebar.multiselect('Select Months', available_months, default=available_months)
+
+    filtered_df = df[(df['Finish_Year'] == selected_year) & (df['Finish_Month_Name'].isin(selected_months))]
+    result_json = filtered_df[['Activity Name', 'Finish_Month_Name']].to_dict(orient='records')
+    
+    if st.button('Count Activities'):
+        process_and_display_data(result_json, selected_months)# import streamlit as st
 # import pandas as pd
 # import requests
 # import json
